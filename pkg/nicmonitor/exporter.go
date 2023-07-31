@@ -26,7 +26,7 @@ type Exporter struct {
 }
 
 const (
-	sysDebugFlowNumDir = "/sys/kernel/debug/nfp_net"
+	sysFlowerDebugDir = "/sys/kernel/debug/nfp_net"
 )
 
 var registerNicMetricsOnce sync.Once
@@ -77,6 +77,7 @@ func (e *Exporter) StartNicMetrics() {
 func (e *Exporter) nicMetricsUpdate() {
 	e.exportNicGauge()
 	e.exportNicFlowNumGauge()
+	e.exportNicStatusGauge()
 }
 
 func (e *Exporter) exportNicGauge() {
@@ -113,7 +114,7 @@ func (e *Exporter) exportNicGauge() {
 		latancy, err := strconv.ParseUint(strings.TrimSpace(outStr[1])[2:], 16, 32)
 		if err == nil {
 			if (latancy & 0xFF000000) == 0 {
-				klog.Errorf("The nic latancy value is invailid.")
+				//klog.Errorf("The nic latancy value is invailid.")
 				continue
 			}
 			latancy = (latancy&0xFFFFFF)*16/1000 + nfp.NFP_PCIE_LAT
@@ -129,26 +130,28 @@ func (e *Exporter) exportNicFlowNumGauge() {
 
 	metricNicFlowNum.Reset()
 	podRwlock.RLock()
-	for podName, vfInfo := range podToVfIndexMap {
-		pci, _ := vfInfo["pci"].(string)
-		podNs, _ := vfInfo["namespace"].(string)
-		vfIndex, _ := vfInfo["vf"].(int)
-		flowNumFile := filepath.Join(sysDebugFlowNumDir, pci, fmt.Sprintf("vf%d", vfIndex), "flow_num")
-		flowNumByte, err := os.ReadFile(flowNumFile)
-		if err != nil {
-			klog.Errorf("Read the flow num error for %s vf%d", pci, vfIndex)
-			continue
+	for podName, podInfo := range podToVfIndexMap {
+		for _, vfInfo := range podInfo.vfReps {
+			pci := vfInfo.pci
+			podNs := podInfo.namespace
+			vfIndex := vfInfo.vfindex
+			flowNumFile := filepath.Join(sysFlowerDebugDir, pci, fmt.Sprintf("vf%d", vfIndex), "flow_num")
+			flowNumByte, err := os.ReadFile(flowNumFile)
+			if err != nil {
+				klog.Errorf("Read the flow num error for %s vf%d", pci, vfIndex)
+				continue
+			}
+			flowNum, err := strconv.Atoi(strings.TrimSpace(string(flowNumByte)))
+			if err != nil {
+				klog.Errorf("The flow num %s format error", string(flowNumByte))
+				continue
+			}
+			metricNicFlowNum.WithLabelValues(podNs, podName, pci).Set(float64(flowNum))
 		}
-		flowNum, err := strconv.Atoi(strings.TrimSpace(string(flowNumByte)))
-		if err != nil {
-			klog.Errorf("The flow num %s format error", string(flowNumByte))
-			continue
-		}
-		metricNicFlowNum.WithLabelValues(podNs, podName).Set(float64(flowNum))
 	}
 	podRwlock.RUnlock()
 	for _, pci := range e.pciDevice {
-		flowNumFile := filepath.Join(sysDebugFlowNumDir, pci, "total_flow_num")
+		flowNumFile := filepath.Join(sysFlowerDebugDir, pci, "total_flow_num")
 		flowNumBuf, err := os.ReadFile(flowNumFile)
 		if err != nil {
 			klog.Errorf("Read the flow num error for %s", pci)
@@ -159,7 +162,7 @@ func (e *Exporter) exportNicFlowNumGauge() {
 			klog.Errorf("The flow num format error:%v", err)
 			continue
 		}
-		metricNicFlowNum.WithLabelValues(e.Hostname, pci).Set(float64(flowNum))
+		metricNicFlowNum.WithLabelValues(e.Hostname, pci, pci).Set(float64(flowNum))
 	}
 }
 
@@ -279,14 +282,25 @@ func (e *Exporter) exportNicStatisticGauge() {
 	}
 
 	podRwlock.RLock()
-	for podName, vfInfo := range podToVfIndexMap {
-		podNs, _ := vfInfo["namespace"].(string)
-		dev, _ := vfInfo["rep"].(string)
+	for podName, podInfo := range podToVfIndexMap {
+		podNs := podInfo.namespace
+		dev := podInfo.ifName
 		e.exportDevStatisticGauge(podNs, podName, dev, stats, true)
 	}
 	podRwlock.RUnlock()
 
 	for _, dev := range e.devs {
 		e.exportDevStatisticGauge(e.Hostname, dev, dev, stats, false)
+	}
+}
+
+func (e *Exporter) exportNicStatusGauge() {
+	metricNicStatus.Reset()
+	for pci, state := range nicState {
+		if state {
+			metricNicStatus.WithLabelValues(e.Hostname, pci).Set(float64(1))
+		} else {
+			metricNicStatus.WithLabelValues(e.Hostname, pci).Set(float64(0))
+		}
 	}
 }

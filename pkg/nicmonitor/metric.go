@@ -35,6 +35,7 @@ var (
 		[]string{
 			"namespace",
 			"pod",
+			"pci",
 		})
 
 	metricNicRxByte = prometheus.NewGaugeVec(
@@ -100,6 +101,17 @@ var (
 			"namespace",
 			"pod",
 		})
+
+	metricNicStatus = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricNamespace,
+			Name:      "status",
+			Help:      "the status of nic.",
+		},
+		[]string{
+			"hostname",
+			"pci",
+		})
 )
 
 func registerNicMetrics() {
@@ -112,4 +124,5 @@ func registerNicMetrics() {
 	prometheus.MustRegister(metricNicTxPkt)
 	prometheus.MustRegister(metricNicRxDropPkt)
 	prometheus.MustRegister(metricNicTxDropPkt)
+	prometheus.MustRegister(metricNicStatus)
 }

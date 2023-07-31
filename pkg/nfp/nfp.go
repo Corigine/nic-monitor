@@ -65,6 +65,7 @@ import (
 
 	"github.com/k8snetworkplumbingwg/sriovnet"
 	utilfs "github.com/k8snetworkplumbingwg/sriovnet/pkg/utils/filesystem"
+	"github.com/vishvananda/netlink"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -1233,7 +1234,19 @@ func updateK8sPodName() {
 		if !ok {
 			continue
 		}
-		repNametoPod[strings.Replace(mac, ":", "", -1)] = pod.Namespace + "/" + pod.Name
+		devname := strings.Replace(mac, ":", "", -1)
+		nodelink, err := netlink.LinkByName(devname)
+		if err != nil {
+			continue
+		}
+		if nodelink.Type() == "bond" {
+			devs := util.GetBondSlave(devname)
+			for _, dev := range devs {
+				repNametoPod[dev] = pod.Namespace + "/" + pod.Name
+			}
+		} else {
+			repNametoPod[devname] = pod.Namespace + "/" + pod.Name
+		}
 	}
 }
 

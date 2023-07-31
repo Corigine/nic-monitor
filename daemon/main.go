@@ -27,6 +27,8 @@ func main() {
 	}
 	exporter := nicmonitor.NewExporter(config)
 	exporter.StartNicMetrics()
+	monitor := nicmonitor.NewNicMonitor(config)
+	monitor.StartNicMonitor()
 
 	http.Handle(config.MetricsPath, promhttp.Handler())
 

@@ -13,7 +13,9 @@ import (
 	"time"
 
 	"github.com/corigine/nic-monitor/pkg/nfp"
+	"github.com/corigine/nic-monitor/pkg/util"
 	"github.com/k8snetworkplumbingwg/sriovnet"
+	"github.com/vishvananda/netlink"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -23,15 +25,28 @@ import (
 	internalapi "k8s.io/cri-api/pkg/apis"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/kubelet/cri/remote"
-	"k8s.io/kubernetes/pkg/kubelet/types"
 )
 
+type vfRepInfo struct {
+	name    string
+	vfindex int
+	pci     string
+}
+
+type podInfo struct {
+	namespace string
+	vfReps    []vfRepInfo
+	ifName    string
+	nsPath    string
+}
+
 var podRwlock sync.RWMutex
-var podToVfIndexMap map[string]map[string]interface{} = make(map[string]map[string]interface{})
-var switchIdtoPci map[string]interface{} = make(map[string]interface{})
+var podToVfIndexMap map[string]podInfo = make(map[string]podInfo)
+var switchIdtoPci map[string]string = make(map[string]string)
 var defaultTimeout = 2 * time.Second
 var defaultRuntimeEndpoints = []string{"unix:///run/containerd/containerd.sock", "unix:///var/run/dockershim.sock", "unix:///run/crio/crio.sock", "unix:///var/run/cri-dockerd.sock"}
-var pciDeviceRegex = regexp.MustCompile(`^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.\d{1}`)
+
+//var pciDeviceRegex = regexp.MustCompile(`^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.\d{1}`)
 
 // Regex that matches on VF representor port name
 var vfPortRepRegex = regexp.MustCompile(`^(?:c\d+)?pf(\d+)vf(\d+)$`)
@@ -65,45 +80,75 @@ func parsePortName(physPortName string) (pfRepIndex, vfRepIndex int, err error) 
 	return pfRepIndex, vfRepIndex, err
 }
 
-func getSriovVfInfo(sandboxId string, info map[string]interface{}) bool {
+func getSriovRepInfo(ifname string) *vfRepInfo {
+	var rep vfRepInfo
+
+	devicePortNameFile := filepath.Join(nfp.NetSysDir, ifname, nfp.NetdevPhysPortName)
+	physPortName, err := os.ReadFile(devicePortNameFile)
+	if err != nil {
+		return nil
+	}
+	rep.name = ifname
+	_, vfindex, err := parsePortName(strings.TrimSpace(string(physPortName)))
+	if err != nil {
+		klog.Errorf("Parese phy port name error for %s", ifname)
+		return nil
+	}
+	rep.vfindex = vfindex
+	swIDFile := filepath.Join(nfp.NetSysDir, ifname, "phys_switch_id")
+	physSwitchID, err := os.ReadFile(swIDFile)
+	if err != nil {
+		klog.Errorf("Can not get the switchid for %s", ifname)
+		return nil
+	}
+
+	pci, ok := switchIdtoPci[strings.TrimSpace(string(physSwitchID))]
+	if !ok {
+		klog.Errorf("Can not get pci for %s", ifname)
+		return nil
+	}
+	rep.pci = pci
+	return &rep
+}
+
+func getSriovInfo(sandboxId string, info *podInfo) bool {
 	var ifname string
 	if os.Getenv("CNI_VENDOR") == "FABRIC" {
 		ifname = strings.Replace(sandboxId, ":", "", -1)
 	} else {
 		ifname = fmt.Sprintf("%s_h", sandboxId[0:12])
 	}
-	devicePortNameFile := filepath.Join(nfp.NetSysDir, ifname, nfp.NetdevPhysPortName)
-	physPortName, err := os.ReadFile(devicePortNameFile)
+	info.ifName = ifname
+	devlink, err := netlink.LinkByName(ifname)
 	if err != nil {
-		return false
-	}
-	info["rep"] = ifname
-	_, vfindex, err := parsePortName(strings.TrimSpace(string(physPortName)))
-	if err != nil {
-		klog.Errorf("Parese phy port name error for %s", ifname)
-		return false
-	}
-	info["vf"] = vfindex
-	swIDFile := filepath.Join(nfp.NetSysDir, ifname, "phys_switch_id")
-	physSwitchID, err := os.ReadFile(swIDFile)
-	if err != nil {
-		klog.Errorf("Can not get the switchid for %s", ifname)
+		klog.Errorf("Get dev %s netlink info error:%v", ifname, err)
 		return false
 	}
 
-	pci, ok := switchIdtoPci[strings.TrimSpace(string(physSwitchID))]
-	if !ok {
-		klog.Errorf("Can not get pci for %s", ifname)
-		return false
+	if devlink.Type() == "bond" {
+		slaveDevs := util.GetBondSlave(ifname)
+		for _, slave := range slaveDevs {
+			rep := getSriovRepInfo(slave)
+			if rep != nil {
+				info.vfReps = append(info.vfReps, *rep)
+			}
+		}
+	} else {
+		rep := getSriovRepInfo(ifname)
+		if rep != nil {
+			info.vfReps = append(info.vfReps, *rep)
+		}
 	}
-	info["pci"] = pci
-	return true
 
+	if len(info.vfReps) != 0 {
+		return true
+	}
+	return false
 }
 
-func getPodAndSriovVf(containerId string) (podName string, info map[string]interface{}) {
-	var err error
+func getPodInfo(containerId string) (map[string]interface{}, error) {
 	var rs internalapi.RuntimeService
+	var err error
 
 	for _, endPoint := range defaultRuntimeEndpoints {
 		rs, err = remote.NewRemoteRuntimeService(endPoint, defaultTimeout, nil)
@@ -111,39 +156,62 @@ func getPodAndSriovVf(containerId string) (podName string, info map[string]inter
 			klog.Errorf("Connect using endpoint %q error:%v", endPoint, err)
 			continue
 		}
-		klog.Info("Connected successfully using endpoint:", endPoint)
 		break
 	}
 	if rs == nil {
-		klog.Info("Can not connect the the docker runtime service")
-		return
+		return nil, fmt.Errorf("Can not connect the the docker runtime service")
 	}
 
 	rep, err := rs.ContainerStatus(context.TODO(), containerId, true)
 	if err != nil {
-		klog.Errorf("Can not get container %s from cri runtime:%v", containerId, err)
-		return
+		return nil, fmt.Errorf("Can not get container %s from cri runtime:%v", containerId, err)
 	}
 
 	result := make(map[string]interface{})
 	if json.Unmarshal([]byte(rep.Info["info"]), &result) != nil {
-		klog.Errorf("Can not get info for %s", containerId)
-		return
+		return nil, fmt.Errorf("Can not get info for %s", containerId)
 	}
+	return result, nil
+}
 
-	sandboxId, ok := result["sandboxID"].(string)
+func getPodSandboxId(info map[string]interface{}) (string, error) {
+	sandboxId, ok := info["sandboxID"].(string)
 	if !ok {
-		klog.Errorf("Can not get sandboxID for %s", containerId)
-		return
+		return "", fmt.Errorf("Can not get sandboxID")
+	}
+	return sandboxId, nil
+}
+
+func getPodNs(info map[string]interface{}) (string, error) {
+	runtimeSpec, ok := info["runtimeSpec"].(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("Can not get runtimeSpec")
+	}
+	linux, ok := runtimeSpec["linux"].(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("Can not get linux info")
+	}
+	namespace, ok := linux["namespaces"].([]interface{})
+	if !ok {
+		return "", fmt.Errorf("Can not get namespaces")
+	}
+	for _, value := range namespace {
+		nsInfo := value.(map[string]interface{})
+		nsType, ok := nsInfo["type"]
+		if !ok {
+			continue
+		}
+		if nsType != "network" {
+			continue
+		}
+		nsPath, ok := nsInfo["path"].(string)
+		if !ok {
+			return "", fmt.Errorf("Can not get network namespace path")
+		}
+		return strings.TrimSpace(nsPath), nil
 	}
 
-	info = make(map[string]interface{})
-	if getSriovVfInfo(sandboxId, info) == true {
-		info["namespace"] = rep.Status.Labels[types.KubernetesPodNamespaceLabel]
-		podName := rep.Status.Labels[types.KubernetesPodNameLabel]
-		return podName, info
-	}
-	return
+	return "", fmt.Errorf("Can not find network namespace path")
 }
 
 func processPodUpdate(old, obj interface{}) {
@@ -155,26 +223,38 @@ func processPodUpdate(old, obj interface{}) {
 	}
 	podRwlock.Lock()
 	defer podRwlock.Unlock()
-	if os.Getenv("CNI_VENDOR") == "FABRIC" {
-		ifname, ok := obj.(*v1.Pod).Annotations["kubernetes.customized/fabric-mac"]
-		if !ok {
-			klog.Infof("Process pod %s add error: no kubernetes.customized/fabric-mac label", obj.(*v1.Pod).Name)
-			return
+	info := podInfo{}
+	for _, cs := range obj.(*v1.Pod).Status.ContainerStatuses {
+		var ifname string
+
+		podinfo, err := getPodInfo(strings.Split(cs.ContainerID, "//")[1])
+		if err != nil {
+			klog.Errorf("Can not get the pod info for %s", obj.(*v1.Pod).Name, err)
 		}
-		info := make(map[string]interface{})
-		if getSriovVfInfo(ifname, info) == true {
-			info["namespace"] = obj.(*v1.Pod).Namespace
-			podToVfIndexMap[obj.(*v1.Pod).Name] = info
-			klog.Infof("Process pod %s add %v", obj.(*v1.Pod).Name, info)
-		}
-	} else {
-		for _, cs := range obj.(*v1.Pod).Status.ContainerStatuses {
-			podname, info := getPodAndSriovVf(strings.Split(cs.ContainerID, "//")[1])
-			if podname != "" {
-				podToVfIndexMap[podname] = info
-				klog.Infof("Process pod %s add %v", podname, info)
+		if os.Getenv("CNI_VENDOR") == "FABRIC" {
+			var ok bool
+			info.nsPath, err = getPodNs(podinfo)
+			if err != nil {
+				klog.Errorf("Get pod %s ns error %v:", obj.(*v1.Pod).Name, err)
+			}
+			ifname, ok = obj.(*v1.Pod).Annotations["kubernetes.customized/fabric-mac"]
+			if !ok {
+				klog.Infof("Process pod %s update error: no kubernetes.customized/fabric-mac label", obj.(*v1.Pod).Name)
+				return
+			}
+		} else {
+			ifname, err = getPodSandboxId(podinfo)
+			if err != nil {
+				klog.Infof("Process pod %s update error: %v", obj.(*v1.Pod).Name, err)
+				continue
 			}
 		}
+		if getSriovInfo(ifname, &info) == true {
+			info.namespace = obj.(*v1.Pod).Namespace
+			podToVfIndexMap[obj.(*v1.Pod).Name] = info
+			klog.Infof("Process pod %s update %v", obj.(*v1.Pod).Name, info)
+		}
+		updatePodStateByNicState(info, obj.(*v1.Pod).Name)
 	}
 }
 
@@ -184,28 +264,42 @@ func processPodAdd(obj interface{}) {
 	if obj.(*v1.Pod).Status.Phase != v1.PodRunning {
 		return
 	}
+	fmt.Println(obj.(*v1.Pod).Name)
 	podRwlock.Lock()
 	defer podRwlock.Unlock()
-	if os.Getenv("CNI_VENDOR") == "FABRIC" {
-		ifname, ok := obj.(*v1.Pod).Annotations["kubernetes.customized/fabric-mac"]
-		if !ok {
-			klog.Infof("Process pod %s add error: no kubernetes.customized/fabric-mac label", obj.(*v1.Pod).Name)
+	info := podInfo{}
+	for _, cs := range obj.(*v1.Pod).Status.ContainerStatuses {
+		var ifname string
+		podinfo, err := getPodInfo(strings.Split(cs.ContainerID, "//")[1])
+		if err != nil {
+			klog.Errorf("Can not get the pod info for %s", obj.(*v1.Pod).Name, err)
 			return
 		}
-		info := make(map[string]interface{})
-		if getSriovVfInfo(ifname, info) == true {
-			info["namespace"] = obj.(*v1.Pod).Namespace
+		if os.Getenv("CNI_VENDOR") == "FABRIC" {
+			var ok bool
+
+			info.nsPath, err = getPodNs(podinfo)
+			if err != nil {
+				klog.Errorf("Get pod %s ns error %v:", obj.(*v1.Pod).Name, err)
+			}
+			ifname, ok = obj.(*v1.Pod).Annotations["kubernetes.customized/fabric-mac"]
+			if !ok {
+				klog.Infof("Process pod %s add error: no kubernetes.customized/fabric-mac label", obj.(*v1.Pod).Name)
+				return
+			}
+		} else {
+			ifname, err = getPodSandboxId(podinfo)
+			if err != nil {
+				klog.Infof("Process pod %s update error: %v", obj.(*v1.Pod).Name, err)
+				continue
+			}
+		}
+		if getSriovInfo(ifname, &info) == true {
+			info.namespace = obj.(*v1.Pod).Namespace
 			podToVfIndexMap[obj.(*v1.Pod).Name] = info
 			klog.Infof("Process pod %s add %v", obj.(*v1.Pod).Name, info)
 		}
-	} else {
-		for _, cs := range obj.(*v1.Pod).Status.ContainerStatuses {
-			podname, info := getPodAndSriovVf(strings.Split(cs.ContainerID, "//")[1])
-			if podname != "" {
-				podToVfIndexMap[podname] = info
-				klog.Infof("Process pod %s add %v", podname, info)
-			}
-		}
+		updatePodStateByNicState(info, obj.(*v1.Pod).Name)
 	}
 }
 
@@ -234,17 +328,30 @@ func startUpdatePodInfoFromK8s(client *kubernetes.Clientset, stopCh chan struct{
 	informer.Run(stopCh)
 }
 
+func getSwitchIdByPci(pci string) (string, error) {
+	netDevs, _ := sriovnet.GetNetDevicesFromPci(pci)
+	for _, netDev := range netDevs {
+		swIDFile := filepath.Join(nfp.NetSysDir, netDev, "phys_switch_id")
+		physSwitchID, err := os.ReadFile(swIDFile)
+		if err != nil || len(physSwitchID) == 0 {
+			continue
+		}
+		return strings.TrimSpace(string(physSwitchID)), nil
+	}
+	return "nil", fmt.Errorf("nic not ready")
+}
+
 func init() {
+	/*Wait for all nfp card ready!!!*/
 	pciDevice := nfp.GetCorigineNicDevice()
 	for _, pci := range pciDevice {
-		netDevs, _ := sriovnet.GetNetDevicesFromPci(pci)
-		for _, netDev := range netDevs {
-			swIDFile := filepath.Join(nfp.NetSysDir, netDev, "phys_switch_id")
-			physSwitchID, err := os.ReadFile(swIDFile)
-			if err != nil || len(physSwitchID) == 0 {
+		for true {
+			physSwitchID, err := getSwitchIdByPci(pci)
+			if err != nil {
+				time.Sleep(1 * time.Second)
 				continue
 			}
-			switchIdtoPci[strings.TrimSpace(string(physSwitchID))] = pci
+			switchIdtoPci[physSwitchID] = pci
 			break
 		}
 	}
